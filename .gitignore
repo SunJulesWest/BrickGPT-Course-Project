@@ -13,3 +13,6 @@ wheels/
 wandb
 *.un~
 .DS_Store
+
+# Local course experiment outputs
+/experiments/runs/
