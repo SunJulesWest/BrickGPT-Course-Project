@@ -77,25 +77,46 @@ mock CLI 不支持渲染。没有 Gurobi 时，可按官方设置 `use_gurobi: f
 `artifacts` 路径相对于该批次目录，采用 `/`，便于整体迁移到 Linux。
 尚未成功导出的结果路径为 `null`；早先导出的文件不会因为后续失败而删除。
 
-后续评价只取每个 `run_id` 的最后一条事件：
+后续评价使用读取函数，按 `run_id` 只取最后一条事件，不能直接统计 JSONL 的行数：
 
 ```python
-import json
+from pathlib import Path
+from run_experiments import load_latest_records
 
-latest = {}
-with open("records.jsonl", encoding="utf-8") as stream:
-    for line in stream:
-        record = json.loads(line)
-        latest[record["run_id"]] = record
-# 使用 latest.values()，按 run_id 与结构评价表合并。
+latest = load_latest_records(Path("records.jsonl"))
+finished = [r for r in latest if r["status"] != "running"]
+generated = [r for r in finished if r.get("generation_status") == "succeeded"]
+# 按 run_id 与队友的评价表一对一关联，评价表本身也需保证 run_id 唯一。
+# 实际评测前检查所需的 artifacts 路径是否非空且文件可读。
 ```
 
 终态为 `succeeded`、`failed` 或 `interrupted`。
 `succeeded` 只表示生成和请求的导出/渲染完成，不代表结构有效或物理稳定。
+独立字段 `generation_status` 用于生成统计：
+
+| 值 | 含义 |
+| --- | --- |
+| `not_started` | 尚未进入生成，包含初始化失败的样本 |
+| `running` | 已进入生成阶段，尚未确认生成完成 |
+| `succeeded` | 官方生成调用与设备同步完成，并取得结构；不保证有效性或稳定性 |
+| `failed` | 生成阶段发生普通异常 |
+| `interrupted` | 生成阶段被 Ctrl-C 中断 |
+
+生成完成后，导出或渲染异常不会改写 `generation_status: succeeded`。
+例如 PNG 渲染失败的终态仍为 `status: failed, stage: render`，
+但 `generation_status: succeeded`，可继续用已有 TXT/JSON 进行结构评价。
+命令行仍以退出码 1 提示整条流水线存在失败，不能将这个退出码当作生成失败率。
+汇总中的 `generation_counts` 单独统计各生成状态，每次尝试只计一次；
+`not_started` 和 `pending` 应分别报告，不混为模型生成失败。
+读取函数兼容旧记录；旧数据缺少 `generation_status` 时保留为空缺，按未知处理，
+不自动将其推断为生成成功或失败。本轮仅增加字段，不改变原有状态与路径字段。
 `stage` 标明初始化、生成、导出或渲染阶段，`error` 保存异常类型、消息及堆栈。
 单次普通异常不会丢弃该样本或阻止其他组合；初始化失败时记录整批失败，且不反复加载模型。
 Ctrl-C 会保存当前实验为 `interrupted` 并停止，未尝试项目仍留在 manifest，汇总中计为 pending。
 若进程被强制终止，最后的 `running` 事件用于识别未完成实验；不自动重试或覆盖。
+`load_latest_records()` 保留这些未完成记录，常规完成样本统计须先排除整体 `running`；
+不能因为阶段状态尚未落盘，就把未完成记录计作生成失败。损坏的 JSON 或无效 ID 会报错，
+不会静默跳过样本。manifest 中尚未尝试的计划不出现在记录文件中，仍计为 pending。
 日志每条事件都 flush/fsync。磁盘写入失败无法保证持久化，将停止批次并报错。
 
 `generation_seconds` 包含设置种子与官方生成调用，成功时使用设备同步后计时，
@@ -117,6 +138,7 @@ mock 的 effective 配置只模拟策略相关字段；真实模式才从官方 
 ## 本地测试
 
 ```sh
+python -m unittest discover -s tests -p test_run_experiments.py -v
 python -S -m unittest discover -s tests -p test_run_experiments.py -v
 ```
 
@@ -124,4 +146,5 @@ python -S -m unittest discover -s tests -p test_run_experiments.py -v
 只运行这一组测试，避免官方 `tests/test_infer.py` 加载真实模型。
 测试覆盖组合展开、唯一 ID、Unicode、重复批次、事件持久化、失败后继续、初始化失败、
 部分导出保留、渲染失败、Ctrl-C、温度策略、配置与种子传递及 CLI 返回码。
+14 项测试还验证后处理失败保留生成成功、按 run_id 去重及与评价结果一对一关联。
 官方适配器测试仅注入替身，不验证模型推理、GPU、Gurobi 或 Blender 的真实行为。

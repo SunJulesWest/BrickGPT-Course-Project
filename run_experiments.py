@@ -182,6 +182,28 @@ def _append_record(stream, record: dict) -> None:
     os.fsync(stream.fileno())
 
 
+def load_latest_records(path: Path) -> list[dict]:
+    """Read one latest event per run_id, including unfinished running attempts.
+
+    Keep legacy rows unchanged: absent generation_status means unknown, not failed.
+    Invalid JSON/IDs raise rather than silently dropping samples from statistics.
+    """
+    latest = {}
+    with Path(path).open(encoding='utf-8') as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                run_id = record['run_id']
+                if not isinstance(run_id, str) or not run_id.strip():
+                    raise ValueError('run_id must be a nonempty string.')
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ValueError(f'{path}:{line_number}: {exc}') from exc
+            latest[run_id] = record
+    return list(latest.values())
+
+
 def _render(ldr_path: Path, png_path: Path) -> None:
     from brickgpt.render_bricks import render_bricks
     render_bricks(str(ldr_path), str(png_path))
@@ -232,6 +254,7 @@ def run_experiments(
     backend = None
     initialization_error = None
     counts = Counter()
+    generation_counts = Counter()
     with (batch_dir / 'records.jsonl').open('x', encoding='utf-8') as stream:
         for job in jobs:
             artifact_dir = batch_dir / job['run_id']
@@ -241,6 +264,7 @@ def run_experiments(
                 'requested_parameters': dict(config, temperature=job['initial_temperature']),
                 'effective_config': None, 'sampling_strategy': None, 'model_revision': None,
                 'status': 'running', 'stage': 'initialization', 'started_at': _now(),
+                'generation_status': 'not_started',
                 'finished_at': None, 'generation_seconds': None, 'total_seconds': None,
                 'render_requested': render,
                 'artifacts': {'txt': None, 'ldr': None, 'bricks_json': None, 'png': None},
@@ -263,6 +287,7 @@ def run_experiments(
                 record['sampling_strategy'] = sampling_strategy(record['effective_config'])
                 record['model_revision'] = backend.model_revision
                 record['stage'] = 'generation'
+                record['generation_status'] = 'running'
                 backend.synchronize()
                 generation_start = time.perf_counter()
                 try:
@@ -272,12 +297,13 @@ def run_experiments(
                 finally:
                     record['generation_seconds'] = time.perf_counter() - generation_start
                 bricks = output['bricks']
+                record['generation_status'] = 'succeeded'
+                record['stage'] = 'export'
                 record['statistics'] = {
                     'n_bricks': len(bricks),
                     'rejection_reasons': dict(output['rejection_reasons']),
                     'n_regenerations': output['n_regenerations'],
                 }
-                record['stage'] = 'export'
                 artifact_dir.mkdir()
                 # Save TXT first: an invalid structure may fail LDraw/JSON export.
                 for key, name, serialize in (
@@ -299,19 +325,25 @@ def run_experiments(
                 record['stage'] = 'complete'
             except KeyboardInterrupt as exc:
                 record['status'] = 'interrupted'
+                if record['generation_status'] == 'running':
+                    record['generation_status'] = 'interrupted'
                 record['error'] = _error(exc)
             except Exception as exc:
                 record['status'] = 'failed'
+                if record['generation_status'] == 'running':
+                    record['generation_status'] = 'failed'
                 record['error'] = _error(exc)
             finally:
                 record['finished_at'] = _now()
                 record['total_seconds'] = time.perf_counter() - started
                 _append_record(stream, record)
                 counts[record['status']] += 1
+                generation_counts[record['generation_status']] += 1
             if record['status'] == 'interrupted':
                 break
     return {'batch_dir': str(batch_dir), 'records': str(batch_dir / 'records.jsonl'),
-            'planned': len(jobs), 'pending': len(jobs) - sum(counts.values()), **counts}
+            'planned': len(jobs), 'pending': len(jobs) - sum(counts.values()),
+            'generation_counts': dict(generation_counts), **counts}
 
 
 def main(argv=None) -> int:

@@ -41,11 +41,16 @@ class BatchTests(unittest.TestCase):
         rows = terminal(summary)
         self.assertEqual((summary['planned'], summary['succeeded'], summary['pending']), (8, 8, 0))
         self.assertEqual(len(events(summary)), 16)
+        latest = runner.load_latest_records(Path(summary['records']))
+        self.assertEqual(len(latest), 8)
+        self.assertEqual(latest, rows)
+        self.assertEqual(summary['generation_counts'], {'succeeded': 8})
         self.assertEqual(len({r['run_id'] for r in rows}), 8)
         self.assertEqual({(r['prompt_id'], r['initial_temperature'], r['seed']) for r in rows},
                          {(p.id, t, s) for p in self.prompts for t in [0.4, 0.6] for s in [1, 42]})
         for row in rows:
             self.assertEqual(row['backend'], 'mock')
+            self.assertEqual(row['generation_status'], 'succeeded')
             self.assertIsNone(row['error'])
             self.assertGreaterEqual(row['total_seconds'], row['generation_seconds'])
             self.assertIsNotNone(row['finished_at'])
@@ -56,6 +61,22 @@ class BatchTests(unittest.TestCase):
                 self.assertTrue((Path(summary['batch_dir']) / relative).is_file())
             self.assertIsNone(row['artifacts']['png'])
         self.assertEqual(json.loads((Path(summary['batch_dir']) / 'manifest.json').read_text(encoding='utf-8'))['jobs'][0]['prompt_id'], 'chair')
+        # A teammate's evaluation rows join once per run_id, not once per event.
+        evaluations = {r['run_id']: {'valid': True, 'stable': False} for r in rows}
+        joined = [{**r, **evaluations[r['run_id']]} for r in latest]
+        self.assertEqual(len(joined), 8)
+        self.assertEqual(sum(r['valid'] for r in joined), 8)
+        self.assertEqual(sum(r['stable'] for r in joined), 0)
+        journal = Path(summary['records'])
+        with journal.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(rows[-1]) + '\n')
+            stream.write('{"run_id":"unfinished","status":"running"}\n')
+            stream.write('{"run_id":"legacy","status":"failed","stage":"render"}\n')
+        reloaded = runner.load_latest_records(journal)
+        self.assertEqual(len(reloaded), 10)
+        self.assertEqual(sum(r['status'] == 'running' for r in reloaded), 1)
+        self.assertEqual(sum(r.get('generation_status') == 'succeeded' for r in reloaded), 8)
+        self.assertNotIn('generation_status', reloaded[-1])
 
     def test_failure_is_retained_and_later_jobs_continue(self):
         summary = self.run_batch(backend_factory=lambda cfg: runner.MockBackend(cfg, ['chair']))
@@ -63,6 +84,8 @@ class BatchTests(unittest.TestCase):
         self.assertEqual((summary['failed'], summary['succeeded']), (4, 4))
         failed = rows[0]
         self.assertEqual(failed['stage'], 'generation')
+        self.assertEqual(failed['generation_status'], 'failed')
+        self.assertEqual(summary['generation_counts'], {'failed': 4, 'succeeded': 4})
         self.assertEqual(failed['error']['type'], 'RuntimeError')
         self.assertIn('Injected mock failure', failed['error']['traceback'])
         self.assertIsNotNone(failed['generation_seconds'])
@@ -78,9 +101,11 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(summary['failed'], 8)
         for row in terminal(summary):
             self.assertEqual(row['stage'], 'initialization')
+            self.assertEqual(row['generation_status'], 'not_started')
             self.assertEqual(row['error']['type'], 'ImportError')
             self.assertIsNone(row['generation_seconds'])
             self.assertIsNone(row['effective_config'])
+        self.assertEqual(summary['generation_counts'], {'not_started': 8})
 
     def test_export_failure_keeps_txt_and_continues(self):
         class BrokenBricks(runner.MockBricks):
@@ -95,6 +120,8 @@ class BatchTests(unittest.TestCase):
         summary = self.run_batch(backend_factory=Backend, temperatures=[0.6], seeds=[1])
         failed, succeeded = terminal(summary)
         self.assertEqual(failed['stage'], 'export')
+        self.assertEqual(failed['generation_status'], 'succeeded')
+        self.assertEqual(summary['generation_counts'], {'succeeded': 2})
         self.assertIsNotNone(failed['artifacts']['txt'])
         self.assertIsNone(failed['artifacts']['ldr'])
         self.assertTrue((Path(summary['batch_dir']) / failed['artifacts']['txt']).exists())
@@ -107,13 +134,26 @@ class BatchTests(unittest.TestCase):
                                  render=True, renderer=broken_renderer)
         row = terminal(summary)[0]
         self.assertEqual((row['status'], row['stage']), ('failed', 'render'))
+        self.assertEqual(row['generation_status'], 'succeeded')
+        self.assertEqual(summary['generation_counts'], {'succeeded': 1})
+        self.assertEqual(runner.load_latest_records(Path(summary['records'])), [row])
         self.assertIsNotNone(row['artifacts']['bricks_json'])
         self.assertIsNone(row['artifacts']['png'])
+        # Interruption in postprocessing must also retain generation success.
+        def interrupted_renderer(*args):
+            raise KeyboardInterrupt()
+        interrupted = self.run_batch(prompts=self.prompts[:1], temperatures=[0.6], seeds=[1],
+                                     render=True, renderer=interrupted_renderer)
+        row = terminal(interrupted)[0]
+        self.assertEqual((row['status'], row['stage']), ('interrupted', 'render'))
+        self.assertEqual(row['generation_status'], 'succeeded')
+        self.assertEqual(interrupted['generation_counts'], {'succeeded': 1})
 
     def test_renderer_must_produce_an_image(self):
         summary = self.run_batch(prompts=self.prompts[:1], temperatures=[0.6], seeds=[1],
                                  render=True, renderer=lambda *args: None)
         self.assertIn('without creating', terminal(summary)[0]['error']['message'])
+        self.assertEqual(terminal(summary)[0]['generation_status'], 'succeeded')
 
     def test_interrupt_is_persisted_and_unattempted_jobs_remain_in_manifest(self):
         class Interrupted(runner.MockBackend):
@@ -122,6 +162,8 @@ class BatchTests(unittest.TestCase):
         summary = self.run_batch(backend_factory=Interrupted)
         self.assertEqual((summary['interrupted'], summary['pending']), (1, 7))
         self.assertEqual(terminal(summary)[0]['error']['type'], 'KeyboardInterrupt')
+        self.assertEqual(terminal(summary)[0]['generation_status'], 'interrupted')
+        self.assertEqual(summary['generation_counts'], {'interrupted': 1})
 
     def test_started_record_is_flushed_before_generation(self):
         root = self.root
@@ -131,6 +173,8 @@ class BatchTests(unittest.TestCase):
                 row = json.loads(journal.read_text(encoding='utf-8').splitlines()[-1])
                 if row['status'] != 'running':
                     raise AssertionError('Missing started record')
+                if row['generation_status'] != 'not_started':
+                    raise AssertionError('Started event must precede generation')
                 return super().generate(*args)
         summary = self.run_batch(backend_factory=Observed)
         self.assertEqual(summary['succeeded'], 8)
@@ -223,8 +267,12 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(result.returncode, expected, result.stderr)
             summary = json.loads(result.stdout)
             self.assertEqual(len(terminal(summary)), 8)
+            self.assertEqual(len(runner.load_latest_records(Path(summary['records']))), 8)
             if expected:
                 self.assertEqual(summary['failed'], 4)
+                self.assertEqual(summary['generation_counts'], {'failed': 4, 'succeeded': 4})
+            else:
+                self.assertEqual(summary['generation_counts'], {'succeeded': 8})
 
 
 if __name__ == '__main__':
